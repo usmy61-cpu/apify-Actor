@@ -1,0 +1,14 @@
+{
+  "actorSpecification": 1,
+  "name": "job-scraper",
+  "title": "Job Scraper – LinkedIn & Custom Sites",
+  "description": "Scrapes job listings from LinkedIn and custom websites by keyword and location. Outputs plain text blocks.",
+  "version": "1.0",
+  "buildTag": "latest",
+  "environmentVariables": {},
+  "defaultRunOptions": {
+    "build": "latest",
+    "timeoutSecs": 600,
+    "memoryMbytes": 2048
+  }
+}
