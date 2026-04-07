@@ -1,6 +1,7 @@
 """
-Proxy utilities — converts Apify proxy configuration into
-format needed by each scraping library.
+Proxy utilities — resolves Apify proxy URL synchronously by
+calling new_url() in the async context (main.py) and passing
+the already-resolved string URL to all scrapers.
 """
 
 import logging
@@ -9,15 +10,30 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-def get_proxy_for_playwright(proxy_configuration: Any) -> dict | None:
+async def resolve_proxy_url(proxy_configuration: Any) -> str | None:
     """
-    Returns a Playwright-compatible proxy dict:
-    { "server": "http://...", "username": "...", "password": "..." }
+    Await proxy_configuration.new_url() in async context.
+    Returns a plain string like 'http://user:pass@proxy.apify.com:8000'
+    Call this ONCE in main.py and pass the string to all scrapers.
     """
     if not proxy_configuration:
         return None
     try:
-        proxy_url = proxy_configuration.new_url()
+        url = await proxy_configuration.new_url()
+        return url
+    except Exception as e:
+        log.warning("Could not resolve proxy URL: %s", e)
+        return None
+
+
+def get_proxy_for_playwright(proxy_url: str | None) -> dict | None:
+    """
+    Converts a plain proxy URL string into Playwright proxy dict.
+    { "server": "http://...", "username": "...", "password": "..." }
+    """
+    if not proxy_url:
+        return None
+    try:
         from urllib.parse import urlparse
         parsed = urlparse(proxy_url)
         proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
@@ -31,16 +47,11 @@ def get_proxy_for_playwright(proxy_configuration: Any) -> dict | None:
         return None
 
 
-def get_proxy_for_requests(proxy_configuration: Any) -> dict | None:
+def get_proxy_for_requests(proxy_url: str | None) -> dict | None:
     """
-    Returns a requests-compatible proxy dict:
+    Converts a plain proxy URL string into requests proxy dict.
     { "http": "http://...", "https": "http://..." }
     """
-    if not proxy_configuration:
+    if not proxy_url:
         return None
-    try:
-        proxy_url = proxy_configuration.new_url()
-        return {"http": proxy_url, "https": proxy_url}
-    except Exception as e:
-        log.warning("Could not build requests proxy dict: %s", e)
-        return None
+    return {"http": proxy_url, "https": proxy_url}
