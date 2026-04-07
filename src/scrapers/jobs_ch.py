@@ -78,12 +78,11 @@ def _try_rest_api(keyword: str, location: str, limit: int, proxies: dict | None)
     }
 
     params = {
-        "query":    keyword,
-        "location": location,
-        "page":     1,
-        "per_page": min(limit, 100),
-        "term":     keyword,
-        "language": "de",
+        "term":        keyword,       # jobs.ch uses 'term' not 'query'
+        "location":    location,
+        "page":        1,
+        "num_results": min(limit, 25),  # jobs.ch uses num_results
+        "language":    "de",
     }
 
     for api_url in API_URLS:
