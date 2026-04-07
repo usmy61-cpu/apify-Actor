@@ -11,6 +11,7 @@ from apify import Actor
 
 from .router import route_scraper
 from .utils.normalizer import normalize_job
+from .utils.proxy import resolve_proxy_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -45,13 +46,23 @@ async def main() -> None:
             keywords, location, len(active_sites), max_per_site,
         )
 
-        # ── Build Apify proxy configuration ─────────────────────────────────
-        proxy_configuration = None
+        # ── Resolve proxy ONCE here in async context ─────────────────────────
+        # proxy_configuration.new_url() is async — resolve it here and pass
+        # the plain string URL to all (sync) scrapers to avoid coroutine errors.
+        proxy_url: str | None = None
         if proxy_cfg.get("useApifyProxy"):
-            proxy_configuration = await Actor.create_proxy_configuration(
-                groups=proxy_cfg.get("apifyProxyGroups", ["RESIDENTIAL"]),
-                country_code=proxy_cfg.get("apifyProxyCountry"),
-            )
+            try:
+                proxy_configuration = await Actor.create_proxy_configuration(
+                    groups=proxy_cfg.get("apifyProxyGroups", ["RESIDENTIAL"]),
+                    country_code=proxy_cfg.get("apifyProxyCountry"),
+                )
+                proxy_url = await resolve_proxy_url(proxy_configuration)
+                if proxy_url:
+                    log.info("Proxy resolved: %s", proxy_url[:40] + "...")
+                else:
+                    log.warning("Proxy configuration returned no URL — running without proxy.")
+            except Exception as e:
+                log.warning("Failed to create proxy configuration: %s — running without proxy.", e)
 
         # ── Open output dataset ──────────────────────────────────────────────
         dataset = await Actor.open_dataset()
@@ -73,7 +84,7 @@ async def main() -> None:
                         keyword=keyword,
                         location=location,
                         max_results=max_per_site,
-                        proxy_configuration=proxy_configuration,
+                        proxy_url=proxy_url,       # plain string, not a coroutine
                         delay_ms=delay_ms,
                         languages=languages,
                     )
