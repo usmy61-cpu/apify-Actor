@@ -1,12 +1,12 @@
 """
 Indeed Switzerland Scraper
-Strategy: JobSpy (primary, best Indeed support) → Playwright+stealth fallback.
+Strategy: JobSpy (primary) → Playwright+stealth fallback.
 Difficulty: 3/5 — Medium
-Anti-bot: Cloudflare + browser fingerprint.
 """
 
 import asyncio
 import logging
+import urllib.parse
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -17,35 +17,34 @@ async def scrape_indeed(
     keyword: str,
     location: str,
     max_results: int,
-    proxy_configuration: Any,
+    proxy_url: str | None,
     delay_ms: int,
     languages: list[str],
     **kwargs,
 ) -> list[dict]:
-    # Primary: JobSpy (no current rate limit on Indeed)
+    # Primary: JobSpy
     loop = asyncio.get_event_loop()
     jobs = await loop.run_in_executor(
-        None, _jobspy_indeed_sync, keyword, location, max_results, proxy_configuration
+        None, _jobspy_indeed_sync, keyword, location, max_results, proxy_url
     )
 
     if jobs:
         return jobs
 
-    # Fallback: Playwright + stealth
     log.warning("Indeed JobSpy returned 0 results — trying Playwright fallback")
-    return await _playwright_indeed(keyword, location, max_results, proxy_configuration, delay_ms)
+    return await _playwright_indeed(keyword, location, max_results, proxy_url, delay_ms)
 
 
-# ── JobSpy path ─────────────────────────────────────────────────────────────
+# ── JobSpy path ──────────────────────────────────────────────────────────────
 
-def _jobspy_indeed_sync(keyword, location, max_results, proxy_configuration) -> list[dict]:
+def _jobspy_indeed_sync(keyword, location, max_results, proxy_url) -> list[dict]:
     try:
         from jobspy import scrape_jobs  # type: ignore
     except ImportError:
-        log.error("jobspy not installed.")
+        log.error("python-jobspy not installed.")
         return []
 
-    proxies = _get_proxy_list(proxy_configuration)
+    proxies = [proxy_url] if proxy_url else None
 
     try:
         results_limit = max_results if max_results > 0 else 100
@@ -60,19 +59,19 @@ def _jobspy_indeed_sync(keyword, location, max_results, proxy_configuration) -> 
         jobs = []
         for _, row in df.iterrows():
             jobs.append({
-                "title":       _safe(row, "title"),
-                "company":     _safe(row, "company"),
-                "location":    _safe(row, "location"),
-                "jobType":     _safe(row, "job_type"),
-                "salary":      _safe(row, "min_amount"),
-                "salaryMin":   _safe(row, "min_amount"),
-                "salaryMax":   _safe(row, "max_amount"),
+                "title":          _safe(row, "title"),
+                "company":        _safe(row, "company"),
+                "location":       _safe(row, "location"),
+                "jobType":        _safe(row, "job_type"),
+                "salary":         None,
+                "salaryMin":      _safe(row, "min_amount"),
+                "salaryMax":      _safe(row, "max_amount"),
                 "salaryCurrency": _safe(row, "currency"),
-                "description": _safe(row, "description"),
-                "requirements": None,
-                "postedDate":  str(_safe(row, "date_posted") or ""),
-                "url":         _safe(row, "job_url"),
-                "isRemote":    _safe(row, "is_remote"),
+                "description":    _safe(row, "description"),
+                "requirements":   None,
+                "postedDate":     str(_safe(row, "date_posted") or ""),
+                "url":            _safe(row, "job_url"),
+                "isRemote":       _safe(row, "is_remote"),
             })
         log.info("Indeed JobSpy: found %d jobs", len(jobs))
         return jobs
@@ -81,15 +80,15 @@ def _jobspy_indeed_sync(keyword, location, max_results, proxy_configuration) -> 
         return []
 
 
-# ── Playwright fallback path ─────────────────────────────────────────────────
+# ── Playwright fallback ──────────────────────────────────────────────────────
 
-async def _playwright_indeed(keyword, location, max_results, proxy_configuration, delay_ms) -> list[dict]:
+async def _playwright_indeed(keyword, location, max_results, proxy_url, delay_ms) -> list[dict]:
     from playwright.async_api import async_playwright
     from ..utils.stealth import apply_stealth_scripts
     from ..utils.proxy import get_proxy_for_playwright
 
     jobs = []
-    proxy = get_proxy_for_playwright(proxy_configuration)
+    proxy = get_proxy_for_playwright(proxy_url)
     results_limit = max_results if max_results > 0 else 100
 
     async with async_playwright() as p:
@@ -106,8 +105,6 @@ async def _playwright_indeed(keyword, location, max_results, proxy_configuration
         await apply_stealth_scripts(context)
         page = await context.new_page()
 
-        # Build Indeed search URL
-        import urllib.parse
         q = urllib.parse.quote_plus(keyword)
         l = urllib.parse.quote_plus(location)
         search_url = f"https://ch.indeed.com/jobs?q={q}&l={l}"
@@ -129,7 +126,6 @@ async def _playwright_indeed(keyword, location, max_results, proxy_configuration
                     if job:
                         jobs.append(job)
 
-                # Try next page
                 next_btn = await page.query_selector("a[data-testid='pagination-page-next']")
                 if not next_btn or page_num >= 9:
                     break
@@ -162,32 +158,11 @@ async def _parse_indeed_card(card) -> dict | None:
         url     = f"https://ch.indeed.com{href}" if href and href.startswith("/") else href
 
         return {
-            "title":       title,
-            "company":     company,
-            "location":    loc,
-            "jobType":     None,
-            "salary":      salary,
-            "salaryMin":   None,
-            "salaryMax":   None,
-            "salaryCurrency": "CHF",
-            "description": None,
-            "requirements": None,
-            "postedDate":  None,
-            "url":         url,
-            "isRemote":    None,
+            "title": title, "company": company, "location": loc,
+            "jobType": None, "salary": salary, "salaryMin": None, "salaryMax": None,
+            "salaryCurrency": "CHF", "description": None, "requirements": None,
+            "postedDate": None, "url": url, "isRemote": None,
         }
-    except Exception:
-        return None
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _get_proxy_list(proxy_configuration) -> list[str] | None:
-    if not proxy_configuration:
-        return None
-    try:
-        url = proxy_configuration.new_url()
-        return [url]
     except Exception:
         return None
 
