@@ -2,20 +2,15 @@
 Jobs.ch Scraper
 Strategy: Playwright + XHR/fetch interception (intercept internal REST API calls).
 Difficulty: 3/5 — Medium
-Anti-bot: Cloudflare CDN + IP rate limiting.
-Structure: React SPA — but exposes internal JSON API via XHR.
+Bug fix: API response may be a list directly — handle both list and dict.
 """
 
 import asyncio
-import json
 import logging
 import urllib.parse
 from typing import Any
 
 log = logging.getLogger(__name__)
-
-# Jobs.ch internal API base (discovered via XHR interception)
-JOBS_CH_API = "https://www.jobs.ch/api/v1/public/search/"
 
 
 async def scrape_jobs_ch(
@@ -23,7 +18,7 @@ async def scrape_jobs_ch(
     keyword: str,
     location: str,
     max_results: int,
-    proxy_configuration: Any,
+    proxy_url: str | None,
     delay_ms: int,
     languages: list[str],
     **kwargs,
@@ -33,8 +28,8 @@ async def scrape_jobs_ch(
     from ..utils.proxy import get_proxy_for_playwright
 
     jobs: list[dict] = []
-    api_responses: list[dict] = []
-    proxy = get_proxy_for_playwright(proxy_configuration)
+    api_responses: list = []
+    proxy = get_proxy_for_playwright(proxy_url)
     results_limit = max_results if max_results > 0 else 200
 
     async with async_playwright() as p:
@@ -50,7 +45,6 @@ async def scrape_jobs_ch(
         )
         await apply_stealth_scripts(context)
 
-        # ── Intercept XHR / fetch responses from the internal API ──────────
         async def handle_response(response: Response):
             try:
                 if "jobs.ch/api" in response.url and response.status == 200:
@@ -70,31 +64,29 @@ async def scrape_jobs_ch(
             await page.goto(search_url, wait_until="networkidle", timeout=35000)
             await asyncio.sleep(delay_ms / 1000)
 
-            # Parse intercepted API responses first
+            # Parse all intercepted API responses
             for api_resp in api_responses:
                 extracted = _parse_jobs_ch_api(api_resp)
                 jobs.extend(extracted)
                 if len(jobs) >= results_limit:
                     break
 
-            # If API interception didn't yield results, fall back to DOM parsing
+            # DOM fallback if API interception yielded nothing
             if not jobs:
                 log.info("Jobs.ch: API interception yielded 0 — falling back to DOM parsing")
                 jobs = await _parse_jobs_ch_dom(page, results_limit, delay_ms)
 
-            # Paginate if needed
+            # Paginate
             page_num = 0
             while len(jobs) < results_limit and page_num < 10:
                 next_btn = await page.query_selector("button[aria-label='Next page'], a[rel='next']")
                 if not next_btn:
                     break
+                prev_count = len(api_responses)
                 await next_btn.click()
                 await asyncio.sleep(delay_ms / 1000)
-                # New API responses captured by handler above
-                new_jobs = []
-                for api_resp in api_responses[len(jobs):]:
-                    new_jobs.extend(_parse_jobs_ch_api(api_resp))
-                jobs.extend(new_jobs)
+                for api_resp in api_responses[prev_count:]:
+                    jobs.extend(_parse_jobs_ch_api(api_resp))
                 page_num += 1
 
         except Exception as e:
@@ -106,56 +98,78 @@ async def scrape_jobs_ch(
     return jobs[:results_limit]
 
 
-def _parse_jobs_ch_api(data: dict) -> list[dict]:
-    """Parse Jobs.ch internal API JSON response."""
+def _parse_jobs_ch_api(data) -> list[dict]:
+    """
+    Parse Jobs.ch internal API JSON response.
+    Handles both dict (wrapped) and list (direct array) responses.
+    """
     jobs = []
-    documents = data.get("documents") or data.get("jobs") or data.get("results") or []
-    if isinstance(data, list):
+
+    # Unwrap if dict — look for common array keys
+    if isinstance(data, dict):
+        documents = (
+            data.get("documents")
+            or data.get("jobs")
+            or data.get("results")
+            or data.get("items")
+            or data.get("data")
+            or []
+        )
+    elif isinstance(data, list):
         documents = data
+    else:
+        return []
 
     for item in documents:
         if not isinstance(item, dict):
             continue
 
-        # Handle nested position/company objects
-        position = item.get("position") or {}
-        company  = item.get("company") or {}
-        salary   = item.get("salary") or {}
+        position      = item.get("position") or {}
+        company_data  = item.get("company") or {}
+        salary        = item.get("salary") or {}
         location_data = item.get("place") or item.get("location") or {}
 
         title     = position.get("title") or item.get("title") or item.get("name")
-        comp_name = company.get("name") or item.get("companyName")
-        loc_name  = location_data.get("city") or location_data.get("name") or item.get("location")
+        comp_name = company_data.get("name") if isinstance(company_data, dict) else company_data
+        comp_name = comp_name or item.get("companyName")
+        loc_name  = (location_data.get("city") or location_data.get("name")) if isinstance(location_data, dict) else location_data
+        loc_name  = loc_name or item.get("location")
         job_url   = item.get("url") or item.get("jobUrl") or item.get("externalUrl")
-        if job_url and not job_url.startswith("http"):
+        if job_url and isinstance(job_url, str) and not job_url.startswith("http"):
             job_url = f"https://www.jobs.ch{job_url}"
 
+        sal_text = None
+        sal_min = sal_max = None
+        if isinstance(salary, dict):
+            sal_text = salary.get("text") or salary.get("description")
+            sal_min  = salary.get("min")
+            sal_max  = salary.get("max")
+
         jobs.append({
-            "title":         title,
-            "company":       comp_name,
-            "location":      loc_name,
-            "jobType":       item.get("workload") or item.get("employmentType"),
-            "salary":        salary.get("text") or salary.get("description"),
-            "salaryMin":     salary.get("min"),
-            "salaryMax":     salary.get("max"),
-            "salaryCurrency": salary.get("currency", "CHF"),
-            "description":   item.get("description") or position.get("description"),
-            "requirements":  item.get("requirements"),
-            "postedDate":    item.get("publicationDate") or item.get("createdAt"),
-            "url":           job_url,
-            "isRemote":      item.get("homeOffice") or item.get("remote"),
+            "title":          title,
+            "company":        comp_name,
+            "location":       loc_name,
+            "jobType":        item.get("workload") or item.get("employmentType"),
+            "salary":         sal_text,
+            "salaryMin":      sal_min,
+            "salaryMax":      sal_max,
+            "salaryCurrency": salary.get("currency", "CHF") if isinstance(salary, dict) else "CHF",
+            "description":    item.get("description") or (position.get("description") if isinstance(position, dict) else None),
+            "requirements":   item.get("requirements"),
+            "postedDate":     item.get("publicationDate") or item.get("createdAt"),
+            "url":            job_url,
+            "isRemote":       item.get("homeOffice") or item.get("remote"),
         })
     return jobs
 
 
 async def _parse_jobs_ch_dom(page, results_limit: int, delay_ms: int) -> list[dict]:
-    """DOM fallback parser for jobs.ch using JSON-LD structured data."""
+    """DOM fallback — JSON-LD then CSS selectors."""
     import extruct  # type: ignore
 
     jobs = []
     html = await page.content()
 
-    # Extract JSON-LD structured data
     try:
         data = extruct.extract(html, syntaxes=["json-ld"])
         for item in data.get("json-ld", []):
@@ -165,17 +179,18 @@ async def _parse_jobs_ch_dom(page, results_limit: int, delay_ms: int) -> list[di
         log.warning("Jobs.ch JSON-LD extraction failed: %s", e)
 
     if not jobs:
-        # Try CSS selectors on job cards
-        cards = await page.query_selector_all("article[data-cy='job-ad-list-item'], div[class*='JobAdListItem']")
+        cards = await page.query_selector_all(
+            "article[data-cy='job-ad-list-item'], div[class*='JobAdListItem'], div[class*='job-card']"
+        )
         for card in cards[:results_limit]:
             try:
                 title_el   = await card.query_selector("h2, h3, [class*='title']")
                 company_el = await card.query_selector("[class*='company'], [class*='employer']")
                 loc_el     = await card.query_selector("[class*='location'], [class*='place']")
-                link_el    = await card.query_selector("a[href*='/job']")
-                title   = await title_el.inner_text()   if title_el   else None
-                company = await company_el.inner_text() if company_el else None
-                location = await loc_el.inner_text()    if loc_el     else None
+                link_el    = await card.query_selector("a[href*='/job'], a[href*='/stelle']")
+                title    = await title_el.inner_text()   if title_el   else None
+                company  = await company_el.inner_text() if company_el else None
+                location = await loc_el.inner_text()     if loc_el     else None
                 href     = await link_el.get_attribute("href") if link_el else None
                 url      = f"https://www.jobs.ch{href}" if href and href.startswith("/") else href
                 jobs.append({
@@ -186,26 +201,24 @@ async def _parse_jobs_ch_dom(page, results_limit: int, delay_ms: int) -> list[di
                 })
             except Exception:
                 continue
-
     return jobs
 
 
 def _jsonld_to_job(item: dict) -> dict:
-    org = item.get("hiringOrganization") or {}
-    loc = item.get("jobLocation") or {}
-    addr = loc.get("address") or loc if isinstance(loc, dict) else {}
-    sal = item.get("baseSalary") or {}
-    sal_val = sal.get("value") or {}
-
+    org     = item.get("hiringOrganization") or {}
+    loc     = item.get("jobLocation") or {}
+    addr    = loc.get("address") or {} if isinstance(loc, dict) else {}
+    sal     = item.get("baseSalary") or {}
+    sal_val = sal.get("value") or {} if isinstance(sal, dict) else {}
     return {
         "title":          item.get("title"),
-        "company":        org.get("name"),
-        "location":       addr.get("addressLocality") or addr.get("addressRegion"),
+        "company":        org.get("name") if isinstance(org, dict) else org,
+        "location":       addr.get("addressLocality") if isinstance(addr, dict) else None,
         "jobType":        item.get("employmentType"),
         "salary":         None,
-        "salaryMin":      sal_val.get("minValue"),
-        "salaryMax":      sal_val.get("maxValue"),
-        "salaryCurrency": sal.get("currency", "CHF"),
+        "salaryMin":      sal_val.get("minValue") if isinstance(sal_val, dict) else None,
+        "salaryMax":      sal_val.get("maxValue") if isinstance(sal_val, dict) else None,
+        "salaryCurrency": sal.get("currency", "CHF") if isinstance(sal, dict) else "CHF",
         "description":    item.get("description"),
         "requirements":   item.get("qualifications") or item.get("experienceRequirements"),
         "postedDate":     item.get("datePosted"),
