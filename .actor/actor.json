@@ -1,0 +1,41 @@
+{
+  "actorSpecification": 1,
+  "name": "swiss-job-scraper",
+  "title": "Swiss Job Board Scraper",
+  "description": "Scrapes job listings from Swiss and international job boards (LinkedIn, Indeed, Jobs.ch, Jobscout24, Topjobs, Alpha.ch, and custom URLs) based on keywords, location, and configurable result limits.",
+  "version": "1.0.0",
+  "buildTag": "latest",
+  "dockerfile": "../Dockerfile",
+  "input": "../.actor/input_schema.json",
+  "storages": {
+    "dataset": {
+      "actorSpecification": 1,
+      "views": {
+        "overview": {
+          "title": "Job Listings",
+          "transformation": {
+            "fields": [
+              "title", "company", "location", "jobType",
+              "salary", "source", "keyword", "url", "postedDate", "scrapedAt"
+            ]
+          },
+          "display": {
+            "component": "table",
+            "properties": {
+              "title":      { "label": "Job Title",    "format": "text" },
+              "company":    { "label": "Company",      "format": "text" },
+              "location":   { "label": "Location",     "format": "text" },
+              "jobType":    { "label": "Job Type",     "format": "text" },
+              "salary":     { "label": "Salary",       "format": "text" },
+              "source":     { "label": "Source Site",  "format": "text" },
+              "keyword":    { "label": "Keyword",      "format": "text" },
+              "url":        { "label": "URL",          "format": "link" },
+              "postedDate": { "label": "Posted",       "format": "text" },
+              "scrapedAt":  { "label": "Scraped At",   "format": "text" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
