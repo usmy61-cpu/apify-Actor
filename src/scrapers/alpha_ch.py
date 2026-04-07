@@ -42,13 +42,15 @@ def _scrape_sync(keyword, location, max_results, proxy_url, delay_ms) -> list[di
     proxies = get_proxy_for_requests(proxy_url)
     limit = max_results if max_results > 0 else 200
     jobs: list[dict] = []
+    seen_urls: set[str] = set()  # deduplicate across languages
 
     for lang, path in LANG_PATHS.items():
-        if jobs:
+        # FIX: removed early `if jobs: break` — try all languages to maximise results
+        if len(jobs) >= limit:
             break
+
         page = 1
         while len(jobs) < limit:
-            # CONFIRMED: alpha.ch uses ?q= and ?l= (location)
             q = urllib.parse.quote_plus(keyword)
             l = urllib.parse.quote_plus(location)
             search_url = f"{BASE_URL}{path}?q={q}&l={l}"
@@ -69,11 +71,18 @@ def _scrape_sync(keyword, location, max_results, proxy_url, delay_ms) -> list[di
             for job in page_jobs:
                 if len(jobs) >= limit:
                     break
-                if job.get("url"):
+
+                # FIX: skip duplicates seen from a previous language
+                job_url = job.get("url", "")
+                if job_url and job_url in seen_urls:
+                    continue
+                if job_url:
+                    seen_urls.add(job_url)
                     time.sleep(0.4)
-                    detail = _detail(job["url"], proxies)
+                    detail = _detail(job_url, proxies)
                     if detail:
                         job.update(detail)
+
                 jobs.append(job)
 
             if not soup.select_one("a[rel='next'], a[href*='page=']"):
@@ -101,7 +110,6 @@ def _parse(soup: BeautifulSoup, lang: str) -> list[dict]:
         return jobs
 
     # ── JobCloud-standard selector: <a href="/{lang}/job/ID"> ───────────
-    # Same structure as topjobs.ch (both are JobCloud products)
     job_links = soup.select(f'a[href*="/{lang}/job/"]')
     seen = set()
 
