@@ -52,7 +52,7 @@ async def scrape_generic(
     keyword: str,
     location: str,
     max_results: int,
-    proxy_configuration: Any,
+    proxy_url: str | None,
     delay_ms: int,
     languages: list[str],
     **kwargs,
@@ -70,7 +70,7 @@ async def scrape_generic(
     # ── Step 1: Try fast static scrape ──────────────────────────────────────
     log.info("Generic scraper [%s]: trying static requests", domain)
     jobs = await asyncio.get_event_loop().run_in_executor(
-        None, _static_scrape, search_url, keyword, location, results_limit, proxy_configuration
+        None, _static_scrape, search_url, keyword, location, results_limit, proxy_url
     )
 
     if jobs:
@@ -80,7 +80,7 @@ async def scrape_generic(
     # ── Step 2: Playwright with XHR interception ─────────────────────────────
     log.info("Generic scraper [%s]: static failed — trying Playwright", domain)
     jobs = await _playwright_scrape(
-        search_url, keyword, location, results_limit, proxy_configuration, delay_ms
+        search_url, keyword, location, results_limit, proxy_url, delay_ms
     )
 
     log.info("Generic scraper [%s]: Playwright found %d jobs", domain, len(jobs))
@@ -89,8 +89,9 @@ async def scrape_generic(
 
 # ── Static path ──────────────────────────────────────────────────────────────
 
-def _static_scrape(url, keyword, location, limit, proxy_configuration) -> list[dict]:
-    proxies = _get_requests_proxy(proxy_configuration)
+def _static_scrape(url, keyword, location, limit, proxy_url) -> list[dict]:
+    from ..utils.proxy import get_proxy_for_requests
+    proxies = get_proxy_for_requests(proxy_url)
     try:
         resp = requests.get(url, headers=_build_headers(), proxies=proxies, timeout=20)
         resp.raise_for_status()
@@ -171,14 +172,14 @@ def _extract_css_jobs(soup: BeautifulSoup, base_url: str) -> list[dict]:
 
 # ── Playwright path ───────────────────────────────────────────────────────────
 
-async def _playwright_scrape(url, keyword, location, limit, proxy_configuration, delay_ms) -> list[dict]:
+async def _playwright_scrape(url, keyword, location, limit, proxy_url, delay_ms) -> list[dict]:
     from playwright.async_api import async_playwright, Response
     from ..utils.stealth import apply_stealth_scripts
     from ..utils.proxy import get_proxy_for_playwright
 
     jobs: list[dict] = []
     api_data_collected: list = []
-    proxy = get_proxy_for_playwright(proxy_configuration)
+    proxy = get_proxy_for_playwright(proxy_url)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -316,15 +317,6 @@ def _build_headers() -> dict:
         "Connection":      "keep-alive",
     }
 
-
-def _get_requests_proxy(proxy_configuration) -> dict | None:
-    if not proxy_configuration:
-        return None
-    try:
-        url = proxy_configuration.new_url()
-        return {"http": url, "https": url}
-    except Exception:
-        return None
 
 
 def _jsonld_to_job(item: dict) -> dict:
