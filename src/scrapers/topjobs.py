@@ -28,19 +28,20 @@ async def scrape_topjobs(
     keyword: str,
     location: str,
     max_results: int,
-    proxy_configuration: Any,
+    proxy_url: str | None,
     delay_ms: int,
     languages: list[str],
     **kwargs,
 ) -> list[dict]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, _scrape_sync, keyword, location, max_results, proxy_configuration, delay_ms, languages
+        None, _scrape_sync, keyword, location, max_results, proxy_url, delay_ms, languages
     )
 
 
-def _scrape_sync(keyword, location, max_results, proxy_configuration, delay_ms, languages) -> list[dict]:
-    proxies = _get_requests_proxy(proxy_configuration)
+def _scrape_sync(keyword, location, max_results, proxy_url, delay_ms, languages) -> list[dict]:
+    from ..utils.proxy import get_proxy_for_requests
+    proxies = get_proxy_for_requests(proxy_url)
     results_limit = max_results if max_results > 0 else 200
     jobs: list[dict] = []
 
@@ -195,15 +196,6 @@ def _build_headers() -> dict:
         "Connection":      "keep-alive",
     }
 
-
-def _get_requests_proxy(proxy_configuration) -> dict | None:
-    if not proxy_configuration:
-        return None
-    try:
-        url = proxy_configuration.new_url()
-        return {"http": url, "https": url}
-    except Exception:
-        return None
 
 
 def _jsonld_to_job(item: dict) -> dict:
