@@ -78,10 +78,10 @@ def _try_rest_api(keyword: str, location: str, limit: int, proxies: dict | None)
     }
 
     params = {
-        "term":        keyword,       # jobs.ch uses 'term' not 'query'
+        "term":        keyword,
         "location":    location,
         "page":        1,
-        "num_results": min(limit, 25),  # jobs.ch uses num_results
+        "num_results": min(limit, 25),
         "language":    "de",
     }
 
@@ -191,7 +191,6 @@ def _parse_jobs_ch_api(data) -> list[dict]:
             data.get("documents") or data.get("jobs") or data.get("results")
             or data.get("items") or data.get("data") or []
         )
-        # If still empty, check nested under "hits" (Elasticsearch-style)
         if not documents:
             hits = data.get("hits") or {}
             if isinstance(hits, dict):
@@ -212,17 +211,62 @@ def _parse_jobs_ch_api(data) -> list[dict]:
             item = item["_source"]
 
         position      = item.get("position") or {}
-        company_data  = item.get("company") or {}
         salary_data   = item.get("salary") or {}
         location_data = item.get("place") or item.get("location") or {}
 
-        title     = (position.get("title") if isinstance(position, dict) else None) or item.get("title") or item.get("name")
-        comp_name = (company_data.get("name") if isinstance(company_data, dict) else company_data) or item.get("companyName")
-        loc_name  = (location_data.get("city") or location_data.get("name") if isinstance(location_data, dict) else location_data) or item.get("location")
-        job_url   = item.get("url") or item.get("jobUrl") or item.get("externalUrl")
+        # ── Title ──────────────────────────────────────────────────────────
+        title = (
+            (position.get("title") if isinstance(position, dict) else None)
+            or item.get("title")
+            or item.get("name")
+        )
+
+        # ── Company: handle dict, anonymous flag, plain string ─────────────
+        company_data = item.get("company") or {}
+        if isinstance(company_data, dict):
+            comp_name = company_data.get("name") or company_data.get("displayName")
+            if not comp_name and company_data.get("anonymous"):
+                comp_name = "Anonymous"
+        elif isinstance(company_data, str) and company_data:
+            comp_name = company_data
+        else:
+            comp_name = None
+        comp_name = comp_name or item.get("companyName") or item.get("company_name")
+
+        # ── Location ───────────────────────────────────────────────────────
+        if isinstance(location_data, dict):
+            loc_name = location_data.get("city") or location_data.get("name") or location_data.get("label")
+        else:
+            loc_name = str(location_data) if location_data else None
+        loc_name = loc_name or item.get("location") or item.get("city")
+
+        # ── URL: prefer direct url fields, fall back to slug construction ──
+        slug = item.get("slug") or (
+            position.get("slug") if isinstance(position, dict) else None
+        )
+        job_url = item.get("url") or item.get("jobUrl") or item.get("externalUrl")
+        if not job_url and slug:
+            job_url = f"{BASE_URL}/de/stellenangebote/{slug}/"
         if job_url and isinstance(job_url, str) and not job_url.startswith("http"):
             job_url = f"{BASE_URL}{job_url}"
 
+        # ── Job Type: workload may be dict {min, max} or string ────────────
+        workload = item.get("workload")
+        if isinstance(workload, dict):
+            w_min = workload.get("min")
+            w_max = workload.get("max")
+            job_type = (
+                f"{w_min}–{w_max}%"
+                if (w_min is not None and w_max is not None)
+                else None
+            )
+        elif isinstance(workload, (str, int, float)) and workload:
+            job_type = str(workload)
+        else:
+            job_type = None
+        job_type = job_type or item.get("employmentType") or item.get("jobType") or item.get("contractType")
+
+        # ── Salary ─────────────────────────────────────────────────────────
         sal_text = sal_min = sal_max = sal_currency = None
         if isinstance(salary_data, dict):
             sal_text     = salary_data.get("text") or salary_data.get("description")
@@ -234,7 +278,7 @@ def _parse_jobs_ch_api(data) -> list[dict]:
             "title":          title,
             "company":        comp_name,
             "location":       loc_name,
-            "jobType":        item.get("workload") or item.get("employmentType"),
+            "jobType":        job_type,
             "salary":         sal_text,
             "salaryMin":      sal_min,
             "salaryMax":      sal_max,
