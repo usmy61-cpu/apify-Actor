@@ -1,0 +1,86 @@
+{
+  "title": "Swiss Job Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "keywords": {
+      "title": "Search Keywords",
+      "type": "array",
+      "description": "List of job keywords to search for (e.g. 'software engineer', 'data analyst').",
+      "editor": "stringList",
+      "default": ["software engineer"],
+      "prefill": ["software engineer"]
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Location to filter jobs (e.g. 'Zurich', 'Switzerland', 'Remote').",
+      "editor": "textfield",
+      "default": "Switzerland",
+      "prefill": "Switzerland"
+    },
+    "websites": {
+      "title": "Target Websites",
+      "type": "array",
+      "description": "Select which job boards to scrape. You can also add custom website URLs.",
+      "editor": "json",
+      "default": [
+        { "name": "LinkedIn",    "url": "https://ch.linkedin.com/jobs/", "enabled": true },
+        { "name": "Indeed",      "url": "https://ch.indeed.com",         "enabled": true },
+        { "name": "Jobs.ch",     "url": "https://www.jobs.ch",           "enabled": true },
+        { "name": "Jobscout24",  "url": "https://www.jobscout24.ch",     "enabled": true },
+        { "name": "Topjobs",     "url": "https://www.topjobs.ch",        "enabled": true },
+        { "name": "Alpha.ch",    "url": "https://www.alpha.ch",          "enabled": true }
+      ],
+      "prefill": [
+        { "name": "LinkedIn",    "url": "https://ch.linkedin.com/jobs/", "enabled": true },
+        { "name": "Indeed",      "url": "https://ch.indeed.com",         "enabled": true },
+        { "name": "Jobs.ch",     "url": "https://www.jobs.ch",           "enabled": true },
+        { "name": "Jobscout24",  "url": "https://www.jobscout24.ch",     "enabled": true },
+        { "name": "Topjobs",     "url": "https://www.topjobs.ch",        "enabled": true },
+        { "name": "Alpha.ch",    "url": "https://www.alpha.ch",          "enabled": true }
+      ]
+    },
+    "maxResultsPerSitePerKeyword": {
+      "title": "Max Results Per Site Per Keyword",
+      "type": "integer",
+      "description": "Maximum number of job listings to collect per website per keyword. Set 0 for unlimited.",
+      "editor": "number",
+      "default": 50,
+      "minimum": 0,
+      "maximum": 500
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Apify Proxy settings. Residential proxies recommended for LinkedIn and Indeed.",
+      "editor": "proxy",
+      "prefill": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"] }
+    },
+    "delayBetweenRequestsMs": {
+      "title": "Delay Between Requests (ms)",
+      "type": "integer",
+      "description": "Milliseconds to wait between requests to avoid rate limiting. Minimum 1000ms recommended.",
+      "editor": "number",
+      "default": 2000,
+      "minimum": 500,
+      "maximum": 10000
+    },
+    "respectRobotsTxt": {
+      "title": "Respect robots.txt",
+      "type": "boolean",
+      "description": "If enabled, the actor will skip paths disallowed by robots.txt. Disable only if you have explicit permission from the site owner.",
+      "editor": "checkbox",
+      "default": false
+    },
+    "languages": {
+      "title": "Language Filter",
+      "type": "array",
+      "description": "Language variants to search on multilingual sites (e.g. 'de', 'en', 'fr').",
+      "editor": "stringList",
+      "default": ["en", "de"],
+      "prefill": ["en", "de"]
+    }
+  },
+  "required": ["keywords", "location", "websites"]
+}
