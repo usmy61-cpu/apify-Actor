@@ -1,12 +1,14 @@
 """
 Jobs.ch Scraper
 Strategy:
-  1. Direct HTTP to internal REST API (discovered from XHR)
+  1. Direct HTTP to internal REST API
   2. Playwright + XHR interception fallback
   3. DOM / JSON-LD fallback
-Difficulty: 3/5 — Medium
 
-Internal API base: https://www.jobs.ch/api/v1/public/search/
+Key fixes:
+  - Exhaustive field mapping for company/url/jobType (API uses non-obvious keys)
+  - URL constructed from id/slug if no direct url field
+  - Raw key logging on first record so mismatches are immediately visible
 """
 
 import asyncio
@@ -21,303 +23,330 @@ from fake_useragent import UserAgent
 log = logging.getLogger(__name__)
 _ua = UserAgent()
 
-BASE_URL  = "https://www.jobs.ch"
-# Known internal REST API endpoints (try in order)
-API_URLS = [
-    "https://www.jobs.ch/api/v1/public/search/",
-    "https://www.jobs.ch/api/v2/public/search/",
-    "https://www.jobs.ch/api/public/jobs/",
-]
+BASE_URL = "https://www.jobs.ch"
+API_URL  = "https://www.jobs.ch/api/v1/public/search/"
 
 
 async def scrape_jobs_ch(
-    url: str,
-    keyword: str,
-    location: str,
-    max_results: int,
-    proxy_url: str | None,
-    delay_ms: int,
-    languages: list[str],
-    **kwargs,
+    url: str, keyword: str, location: str, max_results: int,
+    proxy_url: str | None, delay_ms: int, languages: list[str], **kwargs,
 ) -> list[dict]:
     from ..utils.proxy import get_proxy_for_requests
+    proxies  = get_proxy_for_requests(proxy_url)
+    limit    = max_results if max_results > 0 else 200
+    loop     = asyncio.get_event_loop()
 
-    proxies = get_proxy_for_requests(proxy_url)
-    results_limit = max_results if max_results > 0 else 200
-
-    # ── Strategy 1: Direct REST API call ──────────────────────────────────────
-    loop = asyncio.get_event_loop()
-    jobs = await loop.run_in_executor(
-        None, _try_rest_api, keyword, location, results_limit, proxies
-    )
+    # ── Strategy 1: REST API ───────────────────────────────────────────────
+    jobs = await loop.run_in_executor(None, _rest_api, keyword, location, limit, proxies)
     if jobs:
-        log.info("Jobs.ch REST API: found %d jobs", len(jobs))
+        log.info("Jobs.ch REST API: %d jobs", len(jobs))
         return jobs
 
-    # ── Strategy 2: Playwright + XHR interception ─────────────────────────────
-    log.info("Jobs.ch: REST API returned 0 — trying Playwright XHR interception")
-    jobs = await _playwright_scrape(keyword, location, results_limit, proxy_url, delay_ms)
+    # ── Strategy 2: Playwright XHR interception ────────────────────────────
+    log.info("Jobs.ch REST returned 0 — trying Playwright")
+    jobs = await _playwright_scrape(keyword, location, limit, proxy_url, delay_ms)
     if jobs:
-        log.info("Jobs.ch Playwright: found %d jobs", len(jobs))
+        log.info("Jobs.ch Playwright: %d jobs", len(jobs))
         return jobs
 
-    log.warning("Jobs.ch: all strategies returned 0 jobs")
+    log.warning("Jobs.ch: all strategies returned 0")
     return []
 
 
-# ── REST API path ─────────────────────────────────────────────────────────────
+# ── REST API ──────────────────────────────────────────────────────────────────
 
-def _try_rest_api(keyword: str, location: str, limit: int, proxies: dict | None) -> list[dict]:
-    """Try Jobs.ch internal REST API directly."""
+def _rest_api(keyword: str, location: str, limit: int, proxies) -> list[dict]:
     headers = {
-        "User-Agent":  _ua.random,
-        "Accept":      "application/json, text/plain, */*",
+        "User-Agent":     _ua.random,
+        "Accept":         "application/json, text/plain, */*",
         "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-        "Referer":     "https://www.jobs.ch/de/stellenangebote/",
-        "Origin":      "https://www.jobs.ch",
+        "Referer":        f"{BASE_URL}/de/stellenangebote/",
+        "Origin":         BASE_URL,
     }
-
-    params = {
-        "term":        keyword,       # jobs.ch uses 'term' not 'query'
-        "location":    location,
-        "page":        1,
-        "num_results": min(limit, 25),  # jobs.ch uses num_results
-        "language":    "de",
-    }
-
-    for api_url in API_URLS:
+    # Try multiple param combinations — we don't know the exact API contract
+    param_variants = [
+        {"term": keyword, "location": location, "page": 1, "num_results": min(limit, 25), "language": "de"},
+        {"query": keyword, "location": location, "page": 1, "per_page": min(limit, 25)},
+        {"q": keyword, "location": location, "page": 1, "size": min(limit, 25)},
+        {"term": keyword, "page": 1, "num_results": min(limit, 25)},  # no location
+    ]
+    for params in param_variants:
         try:
-            resp = requests.get(
-                api_url,
-                params=params,
-                headers=headers,
-                proxies=proxies,
-                timeout=20,
-            )
-            log.info("Jobs.ch REST API %s → HTTP %d", api_url, resp.status_code)
-
+            resp = requests.get(API_URL, params=params, headers=headers, proxies=proxies, timeout=20)
+            log.info("Jobs.ch REST %s → HTTP %d", params, resp.status_code)
             if resp.status_code != 200:
                 continue
-
-            try:
-                data = resp.json()
-            except Exception:
-                log.warning("Jobs.ch REST API: non-JSON response from %s", api_url)
-                continue
-
-            jobs = _parse_jobs_ch_api(data)
+            data = resp.json()
+            jobs = _parse_api(data)
             if jobs:
-                log.info("Jobs.ch REST API success: %d jobs from %s", len(jobs), api_url)
                 return jobs
-
         except Exception as e:
-            log.warning("Jobs.ch REST API error for %s: %s", api_url, e)
-            continue
-
+            log.warning("Jobs.ch REST error: %s", e)
     return []
 
 
-# ── Playwright XHR interception path ──────────────────────────────────────────
+def _parse_api(data) -> list[dict]:
+    """
+    Exhaustively handle all known Jobs.ch / JobCloud API response shapes.
+    Logs all keys of the first raw record for debugging.
+    """
+    # Unwrap envelope
+    if isinstance(data, dict):
+        docs = (
+            data.get("documents") or data.get("jobs") or data.get("results")
+            or data.get("items") or data.get("data") or data.get("hits")
+            or []
+        )
+        if isinstance(docs, dict):          # Elasticsearch hits wrapper
+            docs = docs.get("hits") or docs.get("items") or []
+    elif isinstance(data, list):
+        docs = data
+    else:
+        return []
+
+    if not docs:
+        return []
+
+    # Log raw keys on first item for debugging
+    first = docs[0]
+    if isinstance(first, dict):
+        log.info("Jobs.ch API first-item keys: %s", list(first.keys())[:30])
+        # Handle Elasticsearch _source wrapping
+        if "_source" in first:
+            first = first["_source"]
+            log.info("Jobs.ch API _source keys: %s", list(first.keys())[:30])
+
+    jobs = []
+    for raw in docs:
+        if not isinstance(raw, dict):
+            continue
+        # Unwrap _source
+        item = raw.get("_source", raw)
+
+        title    = _pick(item, "title", "jobTitle", "positionTitle", "name", "heading")
+        if not title:
+            continue
+
+        # Company — try nested object then flat string fields
+        company  = _nested_name(item, "company", "advertiser", "employer",
+                                 "hiringOrganization", "companyInfo", "recruiter")
+        company  = company or _pick(item, "companyName", "company_name",
+                                     "advertiser_name", "employerName", "firm")
+
+        # Location — try nested then flat
+        loc_obj  = _nested_locality(item, "place", "location", "jobLocation",
+                                     "address", "city", "workPlace")
+        location = loc_obj or _pick(item, "locationText", "cityName", "region",
+                                     "canton", "workLocation")
+
+        # URL — try direct, then construct from slug or id
+        job_url  = _pick(item, "url", "jobUrl", "link", "href",
+                          "externalUrl", "applyUrl", "detailUrl")
+        if not job_url:
+            slug = _pick(item, "slug", "urlSlug", "jobSlug", "permalink")
+            uid  = _pick(item, "id", "jobId", "uid", "uuid", "externalId")
+            if slug:
+                job_url = f"{BASE_URL}/de/stellenangebote/{slug}/"
+            elif uid:
+                job_url = f"{BASE_URL}/de/stellenangebote/{uid}/"
+
+        # Job type
+        jtype    = _pick(item, "employmentType", "contractType", "workload",
+                          "jobType", "employmentGrade", "workloadText",
+                          "contractTypeLabel", "pensum")
+
+        # Salary
+        sal_obj  = item.get("salary") or item.get("compensation") or item.get("wage") or {}
+        sal_text = None
+        sal_min  = sal_max = sal_cur = None
+        if isinstance(sal_obj, dict):
+            sal_text = _pick(sal_obj, "text", "description", "display", "label")
+            sal_min  = sal_obj.get("min") or sal_obj.get("minValue") or sal_obj.get("from")
+            sal_max  = sal_obj.get("max") or sal_obj.get("maxValue") or sal_obj.get("to")
+            sal_cur  = sal_obj.get("currency", "CHF")
+        elif isinstance(sal_obj, str):
+            sal_text = sal_obj
+
+        # Date
+        date     = _pick(item, "publicationDate", "datePosted", "createdAt",
+                          "postedDate", "publishedAt", "publishDate", "date")
+
+        # Description
+        desc     = _pick(item, "description", "jobDescription", "content",
+                          "bodyText", "fullDescription", "details")
+
+        # Remote
+        remote   = item.get("homeOffice") or item.get("remote") or item.get("isRemote")
+
+        jobs.append({
+            "title":          title,
+            "company":        company,
+            "location":       location,
+            "jobType":        jtype,
+            "salary":         sal_text,
+            "salaryMin":      sal_min,
+            "salaryMax":      sal_max,
+            "salaryCurrency": sal_cur or "CHF",
+            "description":    desc,
+            "requirements":   item.get("requirements") or item.get("qualifications"),
+            "postedDate":     date,
+            "url":            job_url,
+            "isRemote":       remote,
+        })
+
+    log.info("Jobs.ch _parse_api: parsed %d/%d items (company=%d, url=%d)",
+             len(jobs), len(docs),
+             sum(1 for j in jobs if j.get("company")),
+             sum(1 for j in jobs if j.get("url")))
+    return jobs
+
+
+# ── Playwright XHR fallback ───────────────────────────────────────────────────
 
 async def _playwright_scrape(keyword, location, limit, proxy_url, delay_ms) -> list[dict]:
     from playwright.async_api import async_playwright, Response
     from ..utils.stealth import apply_stealth_scripts
     from ..utils.proxy import get_proxy_for_playwright
 
+    import asyncio
     jobs: list[dict] = []
-    api_responses: list = []
+    captured: list   = []
     proxy = get_proxy_for_playwright(proxy_url)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
-            proxy=proxy,
+            headless=True, proxy=proxy,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
         context = await browser.new_context(
             viewport={"width": 1440, "height": 900},
-            user_agent=_ua.random,
-            locale="de-CH",
+            user_agent=_ua.random, locale="de-CH",
         )
         await apply_stealth_scripts(context)
 
-        async def handle_response(response: Response):
+        async def capture(response: Response):
             try:
                 ct = response.headers.get("content-type", "")
-                if ("jobs.ch" in response.url) and ("json" in ct) and response.status == 200:
+                if "jobs.ch" in response.url and "json" in ct and response.status == 200:
                     body = await response.json()
-                    log.info("Jobs.ch XHR captured: %s (type=%s)", response.url[:80], type(body).__name__)
-                    api_responses.append(body)
+                    log.info("Jobs.ch XHR captured: %s", response.url[:100])
+                    captured.append(body)
             except Exception:
                 pass
 
         page = await context.new_page()
-        page.on("response", handle_response)
+        page.on("response", capture)
 
         q = urllib.parse.quote_plus(keyword)
         l = urllib.parse.quote_plus(location)
-        search_url = f"{BASE_URL}/de/stellenangebote/?term={q}&location={l}"
+        await page.goto(
+            f"{BASE_URL}/de/stellenangebote/?term={q}&location={l}",
+            wait_until="networkidle", timeout=40000,
+        )
+        await asyncio.sleep(delay_ms / 1000)
 
-        try:
-            await page.goto(search_url, wait_until="networkidle", timeout=40000)
-            await asyncio.sleep(delay_ms / 1000)
+        for payload in captured:
+            jobs.extend(_parse_api(payload))
+            if len(jobs) >= limit:
+                break
 
-            for api_resp in api_responses:
-                extracted = _parse_jobs_ch_api(api_resp)
-                jobs.extend(extracted)
-                if len(jobs) >= limit:
-                    break
+        if not jobs:
+            html = await page.content()
+            jobs = _dom_fallback(html)
 
-            if not jobs:
-                log.info("Jobs.ch XHR: no API responses captured — trying DOM parsing")
-                jobs = await _parse_jobs_ch_dom(page, limit)
-
-        except Exception as e:
-            log.error("Jobs.ch Playwright error: %s", e, exc_info=True)
-        finally:
-            await browser.close()
+        await browser.close()
 
     return jobs[:limit]
 
 
-# ── Parsers ───────────────────────────────────────────────────────────────────
-
-def _parse_jobs_ch_api(data) -> list[dict]:
-    """Handle both dict (wrapped) and list (direct array) API responses."""
+def _dom_fallback(html: str) -> list[dict]:
+    from bs4 import BeautifulSoup
+    import extruct  # type: ignore
     jobs = []
-
-    if isinstance(data, dict):
-        documents = (
-            data.get("documents") or data.get("jobs") or data.get("results")
-            or data.get("items") or data.get("data") or []
-        )
-        # If still empty, check nested under "hits" (Elasticsearch-style)
-        if not documents:
-            hits = data.get("hits") or {}
-            if isinstance(hits, dict):
-                documents = hits.get("hits") or hits.get("items") or []
-            elif isinstance(hits, list):
-                documents = hits
-    elif isinstance(data, list):
-        documents = data
-    else:
-        return []
-
-    for item in documents:
-        if not isinstance(item, dict):
-            continue
-
-        # Handle Elasticsearch _source wrapping
-        if "_source" in item:
-            item = item["_source"]
-
-        position      = item.get("position") or {}
-        company_data  = item.get("company") or {}
-        salary_data   = item.get("salary") or {}
-        location_data = item.get("place") or item.get("location") or {}
-
-        title     = (position.get("title") if isinstance(position, dict) else None) or item.get("title") or item.get("name")
-        comp_name = (company_data.get("name") if isinstance(company_data, dict) else company_data) or item.get("companyName")
-        loc_name  = (location_data.get("city") or location_data.get("name") if isinstance(location_data, dict) else location_data) or item.get("location")
-        job_url   = item.get("url") or item.get("jobUrl") or item.get("externalUrl")
-        if job_url and isinstance(job_url, str) and not job_url.startswith("http"):
-            job_url = f"{BASE_URL}{job_url}"
-
-        sal_text = sal_min = sal_max = sal_currency = None
-        if isinstance(salary_data, dict):
-            sal_text     = salary_data.get("text") or salary_data.get("description")
-            sal_min      = salary_data.get("min")
-            sal_max      = salary_data.get("max")
-            sal_currency = salary_data.get("currency", "CHF")
-
-        jobs.append({
-            "title":          title,
-            "company":        comp_name,
-            "location":       loc_name,
-            "jobType":        item.get("workload") or item.get("employmentType"),
-            "salary":         sal_text,
-            "salaryMin":      sal_min,
-            "salaryMax":      sal_max,
-            "salaryCurrency": sal_currency or "CHF",
-            "description":    item.get("description") or (position.get("description") if isinstance(position, dict) else None),
-            "requirements":   item.get("requirements"),
-            "postedDate":     item.get("publicationDate") or item.get("createdAt"),
-            "url":            job_url,
-            "isRemote":       item.get("homeOffice") or item.get("remote"),
-        })
-    return jobs
-
-
-async def _parse_jobs_ch_dom(page, limit: int) -> list[dict]:
-    """DOM fallback — JSON-LD then CSS selectors."""
-    jobs = []
-    html = await page.content()
-
     try:
-        import extruct  # type: ignore
         data = extruct.extract(html, syntaxes=["json-ld"])
         for item in data.get("json-ld", []):
-            if item.get("@type") in ("JobPosting", "jobPosting"):
-                jobs.append(_jsonld_to_job(item))
-    except Exception as e:
-        log.warning("Jobs.ch JSON-LD extraction failed: %s", e)
-
+            if "JobPosting" in str(item.get("@type", "")):
+                jobs.append(_from_jsonld(item))
+    except Exception:
+        pass
     if not jobs:
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
-        selectors = [
-            "article[data-cy='job-ad-list-item']",
-            "div[class*='JobAdListItem']",
-            "div[class*='job-card']",
-            "div[class*='result-item']",
-            "li[class*='job']",
-        ]
-        cards = []
-        for sel in selectors:
-            cards = soup.select(sel)
-            if cards:
-                log.info("Jobs.ch DOM: matched '%s' → %d cards", sel, len(cards))
-                break
-
-        for card in cards[:limit]:
-            try:
-                title_el   = card.select_one("h2, h3, [class*='title']")
-                company_el = card.select_one("[class*='company'], [class*='employer']")
-                loc_el     = card.select_one("[class*='location'], [class*='place']")
-                link_el    = card.select_one("a[href]")
-                title    = title_el.get_text(strip=True)   if title_el   else None
-                company  = company_el.get_text(strip=True) if company_el else None
-                location = loc_el.get_text(strip=True)     if loc_el     else None
-                href     = link_el["href"]                 if link_el    else None
-                url      = f"{BASE_URL}{href}" if href and href.startswith("/") else href
-                jobs.append({
-                    "title": title, "company": company, "location": location,
-                    "jobType": None, "salary": None, "salaryMin": None, "salaryMax": None,
-                    "salaryCurrency": "CHF", "description": None, "requirements": None,
-                    "postedDate": None, "url": url, "isRemote": None,
-                })
-            except Exception:
+        for card in soup.select("article[data-cy='job-ad-list-item'], div[class*='job-card'], li[class*='job']"):
+            title_el = card.select_one("h2, h3, [class*='title']")
+            link_el  = card.select_one("a[href]")
+            if not title_el:
                 continue
+            href = link_el["href"] if link_el else None
+            jobs.append({
+                "title":    title_el.get_text(strip=True),
+                "company":  None, "location": None, "jobType": None,
+                "salary":   None, "salaryMin": None, "salaryMax": None,
+                "salaryCurrency": "CHF", "description": None, "requirements": None,
+                "postedDate": None,
+                "url":      (BASE_URL + href if href and href.startswith("/") else href),
+                "isRemote": None,
+            })
     return jobs
 
 
-def _jsonld_to_job(item: dict) -> dict:
-    org     = item.get("hiringOrganization") or {}
-    loc     = item.get("jobLocation") or {}
-    addr    = loc.get("address") or {} if isinstance(loc, dict) else {}
-    sal     = item.get("baseSalary") or {}
-    sal_val = sal.get("value") or {} if isinstance(sal, dict) else {}
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _pick(d: dict, *keys) -> str | None:
+    """Return first non-empty string value among candidate keys."""
+    for k in keys:
+        v = d.get(k)
+        if v and isinstance(v, str):
+            return v.strip() or None
+        if v and isinstance(v, (int, float)):
+            return str(v)
+    return None
+
+
+def _nested_name(item: dict, *keys) -> str | None:
+    """Extract .name from first matching nested object."""
+    for k in keys:
+        obj = item.get(k)
+        if isinstance(obj, dict):
+            name = obj.get("name") or obj.get("displayName") or obj.get("title")
+            if name:
+                return str(name).strip()
+        elif isinstance(obj, str) and obj.strip():
+            return obj.strip()
+    return None
+
+
+def _nested_locality(item: dict, *keys) -> str | None:
+    """Extract city/locality text from first matching nested location object."""
+    for k in keys:
+        obj = item.get(k)
+        if isinstance(obj, dict):
+            city = (obj.get("city") or obj.get("addressLocality")
+                    or obj.get("name") or obj.get("label") or obj.get("text"))
+            if city:
+                return str(city).strip()
+        elif isinstance(obj, str) and obj.strip():
+            return obj.strip()
+    return None
+
+
+def _from_jsonld(item: dict) -> dict:
+    org  = item.get("hiringOrganization") or {}
+    loc  = item.get("jobLocation") or {}
+    addr = (loc.get("address") or {}) if isinstance(loc, dict) else {}
+    sal  = item.get("baseSalary") or {}
+    sv   = (sal.get("value") or {}) if isinstance(sal, dict) else {}
     return {
         "title":          item.get("title"),
         "company":        org.get("name") if isinstance(org, dict) else org,
         "location":       addr.get("addressLocality") if isinstance(addr, dict) else None,
         "jobType":        item.get("employmentType"),
         "salary":         None,
-        "salaryMin":      sal_val.get("minValue") if isinstance(sal_val, dict) else None,
-        "salaryMax":      sal_val.get("maxValue") if isinstance(sal_val, dict) else None,
+        "salaryMin":      sv.get("minValue") if isinstance(sv, dict) else None,
+        "salaryMax":      sv.get("maxValue") if isinstance(sv, dict) else None,
         "salaryCurrency": sal.get("currency", "CHF") if isinstance(sal, dict) else "CHF",
         "description":    item.get("description"),
-        "requirements":   item.get("qualifications") or item.get("experienceRequirements"),
+        "requirements":   item.get("qualifications"),
         "postedDate":     item.get("datePosted"),
         "url":            item.get("url"),
         "isRemote":       item.get("jobLocationType") == "TELECOMMUTE",
