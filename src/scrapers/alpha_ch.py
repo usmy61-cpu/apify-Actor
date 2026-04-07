@@ -1,11 +1,13 @@
 """
 Alpha.ch Scraper
-Strategy: Check RSS/Atom feed first (cleanest data), then requests + BeautifulSoup.
+Strategy: Check RSS feed first → requests + BeautifulSoup fallback.
 Difficulty: 2/5 — Easy
-Anti-bot: Basic — no major WAF. Server-rendered or light JS.
+
+Correct search URL: https://www.alpha.ch/de/job-suche/?query=...&location=...
 """
 
 import asyncio
+import json
 import logging
 import time
 import urllib.parse
@@ -22,13 +24,17 @@ _ua = UserAgent()
 
 BASE_URL = "https://www.alpha.ch"
 
-# Possible RSS feed paths on alpha.ch
+SEARCH_PATHS = {
+    "de": "/de/job-suche/",
+    "en": "/en/job-search/",
+    "fr": "/fr/recherche-emploi/",
+}
+
 RSS_CANDIDATES = [
-    "/de/jobs/rss",
-    "/en/jobs/rss",
-    "/fr/jobs/rss",
-    "/jobs/feed",
-    "/rss/jobs",
+    "/de/job-suche/rss",
+    "/en/job-search/rss",
+    "/jobs/rss",
+    "/rss",
 ]
 
 
@@ -54,38 +60,40 @@ def _scrape_sync(keyword, location, max_results, proxy_url, delay_ms, languages)
     results_limit = max_results if max_results > 0 else 200
     jobs: list[dict] = []
 
-    # ── Try RSS feed first ───────────────────────────────────────────────────
+    # Try RSS first
     rss_jobs = _try_rss(keyword, location, proxies, results_limit)
     if rss_jobs:
-        log.info("Alpha.ch: using RSS feed — found %d items", len(rss_jobs))
+        log.info("Alpha.ch: RSS feed returned %d jobs", len(rss_jobs))
         return rss_jobs[:results_limit]
 
-    # ── Fall back to HTML scraping ───────────────────────────────────────────
-    for lang in languages:
-        if lang not in ("de", "fr", "en"):
-            lang = "de"
-
+    # HTML fallback
+    for lang in ["de", "en", "fr"]:
+        if jobs:
+            break
         page = 1
         while len(jobs) < results_limit:
             search_url = _build_search_url(keyword, location, lang, page)
+            log.info("Alpha.ch fetching: %s", search_url)
             html = _fetch_page(search_url, proxies)
             if not html:
+                log.warning("Alpha.ch: empty response for %s", search_url)
                 break
 
             soup = BeautifulSoup(html, "lxml")
 
-            # Check for RSS link in <head> and try it
+            # Check page <head> for RSS link
             rss_link = soup.select_one("link[type='application/rss+xml'], link[type='application/atom+xml']")
             if rss_link and rss_link.get("href"):
-                rss_url = rss_link["href"]
-                if not rss_url.startswith("http"):
-                    rss_url = BASE_URL + rss_url
+                href = rss_link["href"]
+                rss_url = href if href.startswith("http") else BASE_URL + href
                 rss_jobs = _parse_rss(rss_url, proxies)
                 if rss_jobs:
-                    log.info("Alpha.ch: RSS found in page <head>")
+                    log.info("Alpha.ch: RSS from <head> returned %d jobs", len(rss_jobs))
                     return rss_jobs[:results_limit]
 
-            page_jobs = _parse_listing_page(soup, lang)
+            page_jobs = _parse_listing_page(soup)
+            log.info("Alpha.ch [%s] page %d: parsed %d jobs", lang, page, len(page_jobs))
+
             if not page_jobs:
                 break
 
@@ -93,29 +101,36 @@ def _scrape_sync(keyword, location, max_results, proxy_url, delay_ms, languages)
                 if len(jobs) >= results_limit:
                     break
                 if job.get("url"):
+                    time.sleep(0.5)
                     detail = _fetch_job_detail(job["url"], proxies)
                     if detail:
                         job.update(detail)
                 jobs.append(job)
-                time.sleep(delay_ms / 1000)
 
             if not _has_next_page(soup):
                 break
             page += 1
+            time.sleep(delay_ms / 1000)
 
-        if jobs:
-            break
-
-    log.info("Alpha.ch: found %d jobs", len(jobs))
+    log.info("Alpha.ch: total found %d jobs", len(jobs))
     return jobs
 
 
+def _build_search_url(keyword: str, location: str, lang: str, page: int) -> str:
+    path = SEARCH_PATHS.get(lang, "/de/job-suche/")
+    q = urllib.parse.quote_plus(keyword)
+    l = urllib.parse.quote_plus(location)
+    url = f"{BASE_URL}{path}?query={q}&location={l}"
+    if page > 1:
+        url += f"&page={page}"
+    return url
+
+
 def _try_rss(keyword: str, location: str, proxies: dict | None, limit: int) -> list[dict]:
-    """Try known RSS paths. Return parsed jobs if any feed works."""
+    q = urllib.parse.quote_plus(keyword)
+    l = urllib.parse.quote_plus(location)
     for path in RSS_CANDIDATES:
-        q = urllib.parse.quote_plus(keyword)
-        l = urllib.parse.quote_plus(location)
-        rss_url = f"{BASE_URL}{path}?q={q}&location={l}"
+        rss_url = f"{BASE_URL}{path}?query={q}&location={l}"
         jobs = _parse_rss(rss_url, proxies)
         if jobs:
             return jobs[:limit]
@@ -128,102 +143,76 @@ def _parse_rss(rss_url: str, proxies: dict | None) -> list[dict]:
         if resp.status_code != 200:
             return []
         root = ET.fromstring(resp.text)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
         jobs = []
-
-        # RSS 2.0
         for item in root.iter("item"):
-            title   = item.findtext("title")
-            link    = item.findtext("link")
-            desc    = item.findtext("description")
-            pub_date = item.findtext("pubDate")
-            company = item.findtext("author") or None
-
             jobs.append({
-                "title":          title,
-                "company":        company,
-                "location":       None,
-                "jobType":        None,
-                "salary":         None,
-                "salaryMin":      None,
-                "salaryMax":      None,
-                "salaryCurrency": "CHF",
-                "description":    desc,
-                "requirements":   None,
-                "postedDate":     pub_date,
-                "url":            link,
-                "isRemote":       None,
+                "title":   item.findtext("title"),
+                "company": item.findtext("author"),
+                "location": None, "jobType": None, "salary": None,
+                "salaryMin": None, "salaryMax": None, "salaryCurrency": "CHF",
+                "description": item.findtext("description"),
+                "requirements": None,
+                "postedDate": item.findtext("pubDate"),
+                "url": item.findtext("link"),
+                "isRemote": None,
             })
-
-        # Atom feed
-        for entry in root.findall("atom:entry", ns):
-            title   = entry.findtext("atom:title", namespaces=ns)
-            link_el = entry.find("atom:link", ns)
-            link    = link_el.get("href") if link_el is not None else None
-            desc    = entry.findtext("atom:summary", namespaces=ns)
-            pub     = entry.findtext("atom:updated", namespaces=ns)
-            jobs.append({
-                "title": title, "company": None, "location": None,
-                "jobType": None, "salary": None, "salaryMin": None, "salaryMax": None,
-                "salaryCurrency": "CHF", "description": desc, "requirements": None,
-                "postedDate": pub, "url": link, "isRemote": None,
-            })
-
         return jobs
     except Exception as e:
-        log.debug("RSS parse failed for %s: %s", rss_url, e)
+        log.debug("Alpha.ch RSS parse failed for %s: %s", rss_url, e)
         return []
 
 
-def _build_search_url(keyword: str, location: str, lang: str, page: int) -> str:
-    q = urllib.parse.quote_plus(keyword)
-    l = urllib.parse.quote_plus(location)
-    params = f"?query={q}&location={l}"
-    if page > 1:
-        params += f"&page={page}"
-    return f"{BASE_URL}/{lang}/jobs{params}"
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
 def _fetch_page(url: str, proxies: dict | None) -> str | None:
     try:
-        resp = requests.get(url, headers=_build_headers(), proxies=proxies, timeout=20)
-        resp.raise_for_status()
-        return resp.text
+        resp = requests.get(
+            url, headers=_build_headers(), proxies=proxies, timeout=25, allow_redirects=True
+        )
+        log.info("Alpha.ch HTTP %d for %s", resp.status_code, url)
+        return resp.text if resp.status_code == 200 else None
     except Exception as e:
-        log.warning("Alpha.ch fetch failed %s: %s", url, e)
-        return None
+        log.warning("Alpha.ch fetch error %s: %s", url, e)
+        raise
 
 
-def _parse_listing_page(soup: BeautifulSoup, lang: str) -> list[dict]:
+def _parse_listing_page(soup: BeautifulSoup) -> list[dict]:
     jobs = []
 
-    import json
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
             items = data if isinstance(data, list) else [data]
             for item in items:
-                if item.get("@type") in ("JobPosting", "jobPosting"):
+                if isinstance(item, dict) and item.get("@type") in ("JobPosting", "jobPosting"):
                     jobs.append(_jsonld_to_job(item))
         except Exception:
             continue
     if jobs:
         return jobs
 
-    cards = (
-        soup.select("div.job-list-item, article.job, li.job, div[class*='JobCard'], .job-result, .job-item")
-    )
-    for card in cards:
-        title_el   = card.select_one("h2, h3, .job-title, [class*='title']")
-        company_el = card.select_one(".company, [class*='company']")
-        loc_el     = card.select_one(".location, [class*='location']")
-        link_el    = card.select_one("a[href]")
-        salary_el  = card.select_one(".salary, [class*='salary']")
-        date_el    = card.select_one("time, .date, [class*='date']")
+    selectors = [
+        "div.job-list-item", "article.job", "li.job",
+        "div[class*='JobCard']", "div[class*='job-card']",
+        "div[class*='result-item']", "div[class*='job-item']",
+        "div[class*='vacancy']", "div[class*='stellenangebot']",
+    ]
+    cards = []
+    for sel in selectors:
+        cards = soup.select(sel)
+        if cards:
+            log.info("Alpha.ch: matched '%s' → %d cards", sel, len(cards))
+            break
 
-        href = link_el["href"] if link_el else None
-        url  = f"{BASE_URL}{href}" if href and href.startswith("/") else href
+    for card in cards:
+        title_el   = card.select_one("h2, h3, h4, [class*='title']")
+        company_el = card.select_one("[class*='company'], [class*='employer']")
+        loc_el     = card.select_one("[class*='location'], [class*='place']")
+        link_el    = card.select_one("a[href]")
+        salary_el  = card.select_one("[class*='salary']")
+        date_el    = card.select_one("time[datetime], [class*='date']")
+
+        href = link_el["href"] if link_el and link_el.get("href") else None
+        job_url = f"{BASE_URL}{href}" if href and href.startswith("/") else href
 
         jobs.append({
             "title":          title_el.get_text(strip=True)   if title_el   else None,
@@ -231,14 +220,10 @@ def _parse_listing_page(soup: BeautifulSoup, lang: str) -> list[dict]:
             "location":       loc_el.get_text(strip=True)     if loc_el     else None,
             "jobType":        None,
             "salary":         salary_el.get_text(strip=True)  if salary_el  else None,
-            "salaryMin":      None,
-            "salaryMax":      None,
-            "salaryCurrency": "CHF",
-            "description":    None,
-            "requirements":   None,
+            "salaryMin":      None, "salaryMax": None,
+            "salaryCurrency": "CHF", "description": None, "requirements": None,
             "postedDate":     date_el.get("datetime") if date_el else None,
-            "url":            url,
-            "isRemote":       None,
+            "url":            job_url, "isRemote": None,
         })
     return jobs
 
@@ -246,9 +231,10 @@ def _parse_listing_page(soup: BeautifulSoup, lang: str) -> list[dict]:
 def _fetch_job_detail(job_url: str, proxies: dict | None) -> dict | None:
     try:
         resp = requests.get(job_url, headers=_build_headers(), proxies=proxies, timeout=20)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            return None
         soup = BeautifulSoup(resp.text, "lxml")
-        desc_el   = soup.select_one("[class*='description'], [itemprop='description'], .job-content")
+        desc_el   = soup.select_one("[class*='description'], [itemprop='description'], .job-content, main")
         req_el    = soup.select_one("[class*='requirement'], [class*='qualification']")
         salary_el = soup.select_one("[class*='salary'], [itemprop='baseSalary']")
         type_el   = soup.select_one("[class*='employment'], [itemprop='employmentType']")
@@ -266,35 +252,34 @@ def _fetch_job_detail(job_url: str, proxies: dict | None) -> dict | None:
 
 
 def _has_next_page(soup: BeautifulSoup) -> bool:
-    return bool(soup.select_one("a[rel='next'], .pagination-next, a[aria-label*='next' i]"))
+    return bool(soup.select_one("a[rel='next'], .pagination-next, li.next a, a[aria-label*='next' i]"))
 
 
 def _build_headers() -> dict:
     return {
         "User-Agent":      _ua.random,
-        "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
+        "Accept-Language": "de-CH,de;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection":      "keep-alive",
     }
 
 
-
 def _jsonld_to_job(item: dict) -> dict:
-    org  = item.get("hiringOrganization") or {}
-    loc  = item.get("jobLocation") or {}
-    addr = loc.get("address") or {} if isinstance(loc, dict) else {}
-    sal  = item.get("baseSalary") or {}
-    sal_val = sal.get("value") or {}
+    org     = item.get("hiringOrganization") or {}
+    loc     = item.get("jobLocation") or {}
+    addr    = loc.get("address") or {} if isinstance(loc, dict) else {}
+    sal     = item.get("baseSalary") or {}
+    sal_val = sal.get("value") or {} if isinstance(sal, dict) else {}
     return {
         "title":          item.get("title"),
-        "company":        org.get("name"),
-        "location":       addr.get("addressLocality"),
+        "company":        org.get("name") if isinstance(org, dict) else org,
+        "location":       addr.get("addressLocality") if isinstance(addr, dict) else None,
         "jobType":        item.get("employmentType"),
         "salary":         None,
-        "salaryMin":      sal_val.get("minValue"),
-        "salaryMax":      sal_val.get("maxValue"),
-        "salaryCurrency": sal.get("currency", "CHF"),
+        "salaryMin":      sal_val.get("minValue") if isinstance(sal_val, dict) else None,
+        "salaryMax":      sal_val.get("maxValue") if isinstance(sal_val, dict) else None,
+        "salaryCurrency": sal.get("currency", "CHF") if isinstance(sal, dict) else "CHF",
         "description":    item.get("description"),
         "requirements":   item.get("qualifications"),
         "postedDate":     item.get("datePosted"),
